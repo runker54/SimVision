@@ -1,0 +1,44 @@
+# 忽略table文件夹下的所有文件,但保留文件夹
+table/*
+!table/.gitkeep
+
+# 忽略主文件夹下生成的日志文件
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# PyCharm
+.idea/
+
+# VS Code
+.vscode/
+
+# 分发/打包
+build/
+dist/
+*.egg-info/
+*.egg
+
+# 单元测试/覆盖率报告
+htmlcov/
+.coverage
+.coverage.*
+.cache
+coverage.xml
+
+# mypy
+.mypy_cache/
+
+# 输出文件
+*.xlsx
