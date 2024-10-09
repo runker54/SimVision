@@ -16,7 +16,7 @@
 
 通过为这些不同的方法提供一个统一的平台，我们使研究人员能够进行比较分析，并为他们的特定用例选择最合适的技术。
 
-## 方法论
+## 方法
 
 ### 传统方法
 
@@ -52,8 +52,8 @@
 ### 安装
 
 ```bash
-git clone https://github.com/your-username/image-similarity-project.git
-cd image-similarity-project
+git clone https://github.com/runker54/SimVision.git
+cd SimVision
 pip install -r requirements.txt
 ```
 
