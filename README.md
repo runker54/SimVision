@@ -39,13 +39,11 @@
 
 该框架使用Python实现，利用了关键库：
 
-- OpenCV用于图像处理
+- OpenCV,PIL用于图像处理
 - scikit-image用于SSIM计算
-- TensorFlow和Keras用于深度学习模型
+- TensorFlow,Pytorch和Keras用于深度学习模型
 - Pandas用于数据管理和导出
 - imagehash用于pHash
-
-使用Python的`concurrent.futures`实现并行处理，以提高多核系统上的性能。
 
 ## 使用方法
 
