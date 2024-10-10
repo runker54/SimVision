@@ -57,33 +57,6 @@ cd SimVision
 pip install -r requirements.txt
 ```
 
-### 配置
-
-定义图像组并选择方法：
-
-```python
-groups = {
-    "组1": ["path/to/image1.jpg", "path/to/image2.jpg", "https://example.com/image3.jpg"],
-    "组2": ["path/to/image4.jpg", "path/to/image5.jpg", "https://example.com/image6.jpg"],
-}
-methods = ['ssim', 'histogram', 'phash', 'resnet50'] # 选择方法 可以使用单个或多个组合
-threshold = 0.8 # 相似度阈值
-num_processes = 4 # 进程数
-```
-
-### 执行
-
-```python
-results = main(groups, methods, threshold, num_processes)
-```
-
-## 结果
-
-该框架输出：
-
-1. 一个Excel文件（`similar_images.xlsx`），包含每种方法的成对相似度得分。
-2. 一个详细的日志文件（`image_similarity.log`），记录分析过程。
-
 ## 讨论
 
 本框架支持几个关键的研究方向：
