@@ -3,13 +3,20 @@ import cv2
 import numpy as np
 import pandas as pd
 from skimage.metrics import structural_similarity as ssim
-from concurrent.futures import ProcessPoolExecutor
-from urllib.request import urlretrieve
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+import requests
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 from urllib.parse import urlparse
+from urllib.request import urlretrieve
+from typing import Dict, List, Tuple
+import tempfile
 import imagehash
 from PIL import Image
-from typing import Dict, List, Tuple, Any
 import logging
+from tqdm import tqdm
+import gc
 
 # 工具函数
 def is_url(path):
@@ -22,17 +29,39 @@ def is_url(path):
     except ValueError:
         return False
 
-def load_image(path, as_gray=True):
+def load_image(path, as_gray=True, max_retries=5, backoff_factor=0.5):
     """
-    加载图像,支持本地文件和URL
+    加载图像,支持本地文件和URL，使用流式处理和临时文件
     """
+    session = requests.Session()
+    retry = Retry(total=max_retries, backoff_factor=backoff_factor)
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+
     if is_url(path):
-        temp_file, _ = urlretrieve(path)
-        img = cv2.imread(temp_file)
-        os.unlink(temp_file)
+        try:
+            response = session.get(path, stream=True)
+            response.raise_for_status()
+            with tempfile.NamedTemporaryFile(delete=False, dir=tempfile.gettempdir()) as temp_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    temp_file.write(chunk)
+                temp_file_path = temp_file.name
+            img = cv2.imread(temp_file_path)
+            os.unlink(temp_file_path)
+        except requests.RequestException as e:
+            logging.error(f"加载URL图像 {path} 时发生网络错误: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"无法加载URL图像 {path}: {e}")
+            return None
     else:
         img = cv2.imread(path)
     
+    if img is None:
+        logging.error(f"无法加载图像 {path}")
+        return None
+
     if as_gray:
         return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     return img
@@ -123,98 +152,111 @@ def compare_images(path1, path2, methods):
     """
     results = {}
     
-    # 根据需要加载灰度和彩色图像
-    if 'ssim' in methods or 'histogram' in methods or 'mse' in methods:
-        img1_gray = load_image(path1)
-        img2_gray = load_image(path2)
-        img1_color = load_image(path1, as_gray=False)
-        img2_color = load_image(path2, as_gray=False)
+    img1 = load_image(path1)
+    img2 = load_image(path2)
     
-    # 计算各种相似度
+    if img1 is None or img2 is None:
+        return 0, results
+
     if 'ssim' in methods:
-        results['ssim'] = ssim_similarity(img1_gray, img2_gray)
-    
-    if 'histogram' in methods:
-        results['histogram'] = histogram_similarity(img1_color, img2_color)
-    
-    if 'mse' in methods:
-        results['mse'] = mse_similarity(img1_gray, img2_gray)
+        results['ssim'] = ssim(img1, img2)
     
     if 'phash' in methods:
-        results['phash'] = phash_similarity(path1, path2)
+        img1_pil = Image.fromarray(img1)
+        img2_pil = Image.fromarray(img2)
+        hash1 = imagehash.phash(img1_pil)
+        hash2 = imagehash.phash(img2_pil)
+        results['phash'] = 1 - (hash1 - hash2) / 64  # 归一化到[0, 1]区间
     
-    # 处理深度学习方法
-    deep_learning_methods = [m for m in methods if m in ['resnet50', 'vgg16', 'inceptionv3']]
-    for method in deep_learning_methods:
-        similarity_func = get_deep_learning_similarity(method)
-        results[method] = similarity_func(path1, path2)
+    # 显式删除大型对象
+    del img1, img2, img1_pil, img2_pil
     
-    # 计算综合相似度
     combined_sim = sum(results.values()) / len(results) if results else 0
     return combined_sim, results
 
-def process_group(group, methods, threshold):
+def process_group(group_name, group_images, methods, threshold, logger):
+    logger.info(f"开始处理组 {group_name}")
     results = []
-    n = len(group)
-    for i in range(n):
+    n = len(group_images)
+    for i in tqdm(range(n), desc=f"处理组 {group_name}"):
         for j in range(i+1, n):
             try:
-                similarity, details = compare_images(group[i], group[j], methods)
+                similarity, details = compare_images(group_images[i], group_images[j], methods)
                 if similarity > threshold:
-                    results.append((group[i], group[j], similarity, details))
+                    results.append((group_images[i], group_images[j], similarity, details))
             except Exception as e:
-                print(f"Error processing images {group[i]} and {group[j]}: {e}")
-    return results
-
-def find_similar_images(groups, methods, threshold, num_processes, logger):
-    logger.info(f"开始查找相似图片,使用方法: {methods}, 阈值: {threshold}, 进程数: {num_processes}")
-    results = {}
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
-        all_results = list(executor.map(process_group, groups.values(), [methods] * len(groups), [threshold] * len(groups)))
+                logger.error(f"处理图片 {group_images[i]} 和 {group_images[j]} 时出错: {e}")
     
-    for group_name, group_result in zip(groups.keys(), all_results):
-        if group_result:
-            results[group_name] = group_result
-            logger.info(f"组 {group_name} 找到 {len(group_result)} 对相似图片")
-        else:
-            results[group_name] = [(None, None, 0, {})]
-            logger.info(f"组 {group_name} 没有找到相似图片")
+    if results:
+        logger.info(f"组 {group_name} 找到 {len(results)} 对相似图片")
+    else:
+        logger.info(f"组 {group_name} 没有找到相似图片")
+    
+    return group_name, results
 
-    return results
+def process_groups_in_batches(groups, methods, threshold, num_processes, logger, batch_size=50):
+    all_results = {}
+    group_items = list(groups.items())
+    total_batches = (len(group_items) + batch_size - 1) // batch_size
+
+    for i in tqdm(range(0, len(group_items), batch_size), total=total_batches, desc="处理批次"):
+        batch = dict(group_items[i:i+batch_size])
+        logger.info(f"处理批次 {i//batch_size + 1}/{total_batches}, 包含 {len(batch)} 组")
+        
+        with ProcessPoolExecutor(max_workers=num_processes) as executor:
+            future_to_group = {executor.submit(process_group, name, images, methods, threshold, logger): name 
+                               for name, images in batch.items()}
+            
+            for future in concurrent.futures.as_completed(future_to_group):
+                group_name, group_result = future.result()
+                all_results[group_name] = group_result
+
+    return all_results
 
 def save_results_to_excel(results: Dict[str, List[Tuple[str, str, float, Dict[str, float]]]], methods: List[str], filename: str = 'similar_images.xlsx', logger=None):
     data = []
-    max_similar_images = 0
-
     for group_name, similarities in results.items():
-        if not similarities or similarities[0][0] is None:
-            row = [group_name, "无相似性图片", ""] + [""] * len(methods)
-            data.append(row)
+        if not similarities:
+            row = [str(group_name), "无相似性图片", "", ""] + [""] * len(methods)
         else:
-            similarity_groups = {}
+            similar_images = set()
             for sim in similarities:
-                key = frozenset([sim[0], sim[1]])
-                similarity_groups.setdefault(key, []).append(sim)
+                similar_images.add(sim[0])
+                similar_images.add(sim[1])
+            
+            avg_similarity = sum(sim[2] for sim in similarities) / len(similarities)
+            method_scores = {m: sum(sim[3].get(m, 0) for sim in similarities) / len(similarities) for m in methods}
+            
+            row = [
+                str(group_name),
+                "有相似性图片",
+                f"{len(similarities)}对",
+                f"{len(similar_images)}张"
+            ]
+            row.extend([f"{avg_similarity:.4f}"] + [f"{method_scores.get(m, 0):.4f}" for m in methods])
+            row.append(", ".join(similar_images))
+        
+        data.append(row)
 
-            for group in similarity_groups.values():
-                avg_similarity = sum(sim[2] for sim in group) / len(group)
-                similar_images = list(set().union(*[{sim[0], sim[1]} for sim in group]))
-                max_similar_images = max(max_similar_images, len(similar_images))
-                
-                row = [group_name, "有相似性图片", avg_similarity]
-                row.extend([sum(sim[3].get(m, 0) for sim in group) / len(group) for m in methods])
-                row.extend(similar_images)
-                data.append(row)
-
-    # 确保所有行有相同的长度
-    max_row_length = max(len(row) for row in data)
-    columns = ['组名', '相似性', '平均相似度'] + methods + [f'相似图片{i+1}' for i in range(max_row_length - 3 - len(methods))]
-
-    for row in data:
-        row.extend([''] * (max_row_length - len(row)))
-
+    columns = ['组名', '相似性', '相似对数', '相似图片数', '平均相似度'] + methods + ['相似图片']
     df = pd.DataFrame(data, columns=columns)
-    df.to_excel(filename, index=False)
+    
+    # 指定组名列为字符串类型
+    df['组名'] = df['组名'].astype(str)
+    
+    # 对结果进行排序
+    df = df.sort_values(by='平均相似度', ascending=False)
+    
+    # 使用 ExcelWriter 来设置列格式
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Sheet1')
+        workbook = writer.book
+        worksheet = writer.sheets['Sheet1']
+        
+        # 设置组名列为文本格式
+        for cell in worksheet['A']:
+            cell.number_format = '@'
+
     if logger:
         logger.info(f"结果已保存到 {filename}")
     else:
@@ -240,60 +282,33 @@ def main(groups, methods, threshold, num_processes, log_file='image_similarity.l
     """
     logger = setup_logger(log_file)
     logger.info("开始执行图片相似度分析")
-    logger.info(f"图片组: {groups}")
+    logger.info(f"图片组: 共{len(groups)}组")
     logger.info(f"使用方法: {methods}")
     logger.info(f"相似度阈值: {threshold}")
     logger.info(f"并行进程数: {num_processes}")
     
     # 查找相似图片
-    similar_pairs = find_similar_images(groups, methods, threshold, num_processes, logger)
+    similar_pairs = process_groups_in_batches(groups, methods, threshold, num_processes, logger)
     
     # 保存结果到Excel
     save_results_to_excel(similar_pairs, methods, 'similar_images.xlsx', logger)
-    
-    # 输出结果日志
-    for group_name, similarities in similar_pairs.items():
-        logger.info(f"组名: {group_name}")
-        if not similarities or similarities[0][0] is None:
-            logger.info("无相似性图片")
-        else:
-            similarity_groups = {}
-            for sim in similarities:
-                key = frozenset([sim[0], sim[1]])
-                similarity_groups.setdefault(key, []).append(sim)
-            
-            for i, group in enumerate(similarity_groups.values(), 1):
-                similar_images = list(set().union(*[{s[0], s[1]} for s in group]))
-                logger.info(f"相似图片组 {i}:")
-                logger.info(f"相似图片: {', '.join(similar_images)}")
-                avg_similarity = sum(s[2] for s in group) / len(group)
-                logger.info(f"平均相似度: {avg_similarity:.2f}")
-                for method in methods:
-                    avg_method_similarity = sum(s[3].get(method, 0) for s in group) / len(group)
-                    logger.info(f"{method}: {avg_method_similarity:.2f}")
-                logger.info("---")
     
     logger.info("图片相似度分析完成")
     return similar_pairs
 
 # 示例用法
 if __name__ == "__main__":
-    groups = {
-        "组1": [
-                'https://sanpu.iarrp.cn/ssp-dccy/2023-11-10/520330/70da4515-f196-4ee4-867d-2f055614b030.jpg',
-                "https://sanpu.iarrp.cn/ssp-dccy/2023-11-10/520330/70da4515-f196-4ee4-867d-2f055614b031.jpg",
-                "https://sanpu.iarrp.cn/ssp-dccy/2023-11-10/520330/70da4515-f196-4ee4-867d-2f055614b032.jpg",
-        ],
-        "组2": [
-            r"C:\Users\Runker\Desktop\C.jpg",
-            r"C:\Users\Runker\Desktop\D.jpg",
-            r"C:\Users\Runker\Desktop\E.jpg",
-            r"C:\Users\Runker\Desktop\F.jpg",
-            r"C:\Users\Runker\Desktop\G.jpg",
-            r"C:\Users\Runker\Desktop\H.jpg",
-        ],
-    }
-    methods = ['ssim', 'histogram', 'phash']
-    threshold = 0.8
-    num_processes = 2
-    results = main(groups, methods, threshold, num_processes)
+    # 图片url表 
+    img_df = pd.read_excel('../table/img_info_20241010_1427.xlsx')
+    # 首先，过滤出 wjfl 为 1300 的图片
+    filtered_df = img_df[img_df['wjfl'] == 1300]
+    # 使用 groupby 和 agg 来创建字典
+    img_url_dict = filtered_df.groupby('glbh')['wjlj'].agg(list).to_dict()
+    # 使用main函数进行图片相似度计算
+    # groups = dict(list(img_url_dict.items()))   # 图片组 这里只示例前5组
+    groups = img_url_dict
+    # methods = ['ssim','phash','vgg16','resnet50','inceptionv3']  # 相似度计算方法  这里选择ssim,histogram,phash三种方法组合。 # resnet50 vgg16 inceptionv3
+    methods = ['phash','ssim','histogram']  # 相似度计算方法  这里选择ssim,histogram,phash三种方法组合。 # resnet50 vgg16 inceptionv3
+    threshold = 0.6  # 相似度阈值
+    num_processes = min(os.cpu_count(), 48)  # 减少进程数以降低磁盘压力
+    main(groups,methods,threshold,num_processes)
