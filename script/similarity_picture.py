@@ -1,22 +1,48 @@
 import os
-import cv2
 import numpy as np
 import pandas as pd
-from skimage.metrics import structural_similarity as ssim
-import concurrent.futures
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from sklearn.metrics.pairwise import cosine_similarity
+from typing import Dict, List, Tuple
+import logging
+from tqdm import tqdm
+import torch
+from torchvision import transforms
+from torchvision import models
+from PIL import Image
 import requests
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
 from urllib.parse import urlparse
-from urllib.request import urlretrieve
-from typing import Dict, List, Tuple
 import tempfile
-import imagehash
-from PIL import Image
-import logging
-from tqdm import tqdm
-import gc
+import concurrent.futures
+from concurrent.futures import ProcessPoolExecutor
+import cv2
+from scipy.spatial.distance import cosine
+import cv2
+from skimage.metrics import structural_similarity as ssim
+from scipy.spatial.distance import hamming
+import sys
+
+# 设置日志记录
+def setup_logger(log_file_path):
+    logging.basicConfig(level=logging.INFO, 
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        handlers=[
+                            logging.FileHandler(log_file_path),
+                            logging.StreamHandler()
+                        ])
+    return logging.getLogger(__name__)
+
+# 设置设备
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 图像预处理
+preprocess = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                         std=[0.229, 0.224, 0.225]),
+])
 
 # 工具函数
 def is_url(path):
@@ -29,7 +55,7 @@ def is_url(path):
     except ValueError:
         return False
 
-def load_image(path, as_gray=True, max_retries=5, backoff_factor=0.5):
+def load_image(path, max_retries=5, backoff_factor=0.5):
     """
     加载图像,支持本地文件和URL，使用流式处理和临时文件
     """
@@ -47,7 +73,7 @@ def load_image(path, as_gray=True, max_retries=5, backoff_factor=0.5):
                 for chunk in response.iter_content(chunk_size=8192):
                     temp_file.write(chunk)
                 temp_file_path = temp_file.name
-            img = cv2.imread(temp_file_path)
+            image = Image.open(temp_file_path).convert('RGB')
             os.unlink(temp_file_path)
         except requests.RequestException as e:
             logging.error(f"加载URL图像 {path} 时发生网络错误: {e}")
@@ -56,259 +82,321 @@ def load_image(path, as_gray=True, max_retries=5, backoff_factor=0.5):
             logging.error(f"无法加载URL图像 {path}: {e}")
             return None
     else:
-        img = cv2.imread(path)
+        try:
+            image = Image.open(path).convert('RGB')
+        except Exception as e:
+            logging.error(f"无法加载本地图像 {path}: {e}")
+            return None
     
-    if img is None:
-        logging.error(f"无法加载图像 {path}")
+    return image
+
+# Siamese 网络特征提取
+class SiameseFeatureExtractor:
+    def __init__(self, model_name='resnet50', logger=None):
+        self.model_name = model_name
+        self.model = self._get_model()
+        self.model = self.model.to(device)
+        self.model.eval()
+        self.logger = logger
+
+    def _get_model(self):
+        if self.model_name == 'resnet50':
+            model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
+        elif self.model_name == 'vgg16':
+            model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
+        elif self.model_name == 'densenet121':
+            model = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+        else:
+            raise ValueError(f"不支持的模型: {self.model_name}")
+        
+        # 去掉最后的全连接层
+        if self.model_name.startswith('resnet'):
+            model.fc = torch.nn.Identity()
+        elif self.model_name.startswith('vgg'):
+            model.classifier = torch.nn.Identity()
+        elif self.model_name.startswith('densenet'):
+            model.classifier = torch.nn.Identity()
+        
+        return model
+
+    def extract_features(self, img_path):
+        try:
+            image = load_image(img_path)
+            if image is None:
+                return None
+            image = preprocess(image).unsqueeze(0).to(device)
+            with torch.no_grad():
+                features = self.model(image)
+            return features.cpu().numpy().flatten()
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"无法提取图像特征 {img_path}: {e}")
+            return None
+
+# 计算余弦相似度
+def compute_cosine_similarity(feat1, feat2):
+    return cosine_similarity([feat1], [feat2])[0][0]
+
+def calculate_histogram_similarity(img1_path, img2_path):
+    """
+    计算两张图片的直方图相似度
+    """
+    # 使用 os.path.normpath 来规范化路径
+    img1_path = os.path.normpath(img1_path)
+    img2_path = os.path.normpath(img2_path)
+    
+    # 尝试使用 PIL 加载图像
+    try:
+        img1 = Image.open(img1_path).convert('RGB')
+        img2 = Image.open(img2_path).convert('RGB')
+    except Exception as e:
+        print(f"无法打开图像文件: {e}")
         return None
+    
+    # 将 PIL 图像转换为 OpenCV 格式
+    img1 = cv2.cvtColor(np.array(img1), cv2.COLOR_RGB2BGR)
+    img2 = cv2.cvtColor(np.array(img2), cv2.COLOR_RGB2BGR)
+    
+    # 计算直方图
+    hist1 = cv2.calcHist([img1], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    hist2 = cv2.calcHist([img2], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    
+    hist1 = cv2.normalize(hist1, hist1).flatten()
+    hist2 = cv2.normalize(hist2, hist2).flatten()
+    
+    return 1 - cosine(hist1, hist2)  # 转换为相似度
 
-    if as_gray:
-        return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    return img
+def calculate_ssim(img1_path, img2_path):
+    """
+    计算两张图片的结构相似性指数（SSIM）
+    """
+    # 使用 os.path.normpath 来规范化路径
+    img1_path = os.path.normpath(img1_path)
+    img2_path = os.path.normpath(img2_path)
+    
+    # 尝试使用 PIL 加载图像
+    try:
+        img1 = Image.open(img1_path).convert('RGB')
+        img2 = Image.open(img2_path).convert('RGB')
+    except Exception as e:
+        print(f"无法打开图像文件: {e}")
+        return None
+    
+    # 将 PIL 图像转换为 OpenCV 格式
+    img1 = cv2.cvtColor(np.array(img1), cv2.COLOR_RGB2BGR)
+    img2 = cv2.cvtColor(np.array(img2), cv2.COLOR_RGB2BGR)
+    
+    # 转换为灰度图像
+    img1_gray = cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)
+    img2_gray = cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)
+    
+    # 确保两张图片大小相同
+    height, width = img1_gray.shape
+    img2_gray = cv2.resize(img2_gray, (width, height))
+    
+    # 计算 SSIM
+    ssim_value, _ = ssim(img1_gray, img2_gray, full=True)
+    return ssim_value
 
-# 非深度学习相似度方法
-def ssim_similarity(img1, img2):
+def calculate_average_hash(img_path):
     """
-    计算结构相似性指数(SSIM)
+    计算图像的平均哈希值
     """
-    return ssim(img1, img2)
+    try:
+        # 使用 PIL 打开图像
+        img = Image.open(img_path).convert('L')
+        img = np.array(img)
+    except Exception as e:
+        print(f"无法打开图像文件 {img_path}: {e}")
+        return None
+    
+    # 调整图像大小为8x8
+    img = cv2.resize(img, (8, 8))
+    
+    # 计算平均值
+    mean = np.mean(img)
+    
+    # 根据平均值生成哈希
+    hash_value = 0
+    for i in range(8):
+        for j in range(8):
+            if img[i, j] > mean:
+                hash_value |= 1 << (i * 8 + j)
+    
+    return hash_value
 
-def histogram_similarity(img1, img2):
+def calculate_hash_similarity(img1_path, img2_path):
     """
-    计算直方图相似度
+    计算两张图片的平均哈希相似度
     """
-    hist1 = cv2.calcHist([img1], [0], None, [256], [0, 256])
-    hist2 = cv2.calcHist([img2], [0], None, [256], [0, 256])
-    return cv2.compareHist(hist1, hist2, cv2.HISTCMP_CORREL)
+    hash1 = calculate_average_hash(img1_path)
+    hash2 = calculate_average_hash(img2_path)
+    
+    if hash1 is None or hash2 is None:
+        return None
+    
+    # 计算汉明距离
+    hamming_distance = bin(hash1 ^ hash2).count('1')
+    
+    # 转换为相似度（0-1范围）
+    similarity = 1 - hamming_distance / 64.0
+    
+    return similarity
 
-def mse_similarity(img1, img2):
-    """
-    计算均方误差(MSE)相似度
-    """
+def calculate_mse(img1_path, img2_path):
+    """计算均方误差（MSE）"""
+    img1 = cv2.imdecode(np.fromfile(img1_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    img2 = cv2.imdecode(np.fromfile(img2_path, dtype=np.uint8), cv2.IMREAD_UNCHANGED)
+    if img1 is None or img2 is None:
+        return None
+    img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
     err = np.sum((img1.astype("float") - img2.astype("float")) ** 2)
     err /= float(img1.shape[0] * img1.shape[1])
-    return 1 - (err / 255**2)  # 归一化并反转MSE以获得相似度
+    return err
 
-def phash_similarity(path1, path2):
-    """
-    计算感知哈希(pHash)相似度
-    """
-    img1 = Image.open(path1) if not is_url(path1) else Image.open(urlretrieve(path1)[0])
-    img2 = Image.open(path2) if not is_url(path2) else Image.open(urlretrieve(path2)[0])
-    hash1 = imagehash.phash(img1)
-    hash2 = imagehash.phash(img2)
-    return 1 - (hash1 - hash2) / 64  # 归一化到[0, 1]区间
+def calculate_psnr(img1_path, img2_path):
+    """计算峰值信噪比（PSNR）"""
+    mse = calculate_mse(img1_path, img2_path)
+    if mse is None or mse == 0:
+        return None
+    return 20 * np.log10(255.0) - 10 * np.log10(mse)
 
-# 深度学习方法 (仅在需要时导入和初始化)
-def get_deep_learning_similarity(method):
-    import tensorflow as tf
-    from tensorflow.keras.applications import ResNet50, VGG16, InceptionV3
-    from tensorflow.keras.preprocessing import image
-    from tensorflow.keras.applications.resnet50 import preprocess_input as resnet_preprocess
-    from tensorflow.keras.applications.vgg16 import preprocess_input as vgg_preprocess
-    from tensorflow.keras.applications.inception_v3 import preprocess_input as inception_preprocess
-    from sklearn.metrics.pairwise import cosine_similarity
-
-    def load_model(model_name):
-        if model_name == 'resnet50':
-            return ResNet50(weights='imagenet', include_top=False, pooling='avg'), resnet_preprocess, (224, 224)
-        elif model_name == 'vgg16':
-            return VGG16(weights='imagenet', include_top=False, pooling='avg'), vgg_preprocess, (224, 224)
-        elif model_name == 'inceptionv3':
-            return InceptionV3(weights='imagenet', include_top=False, pooling='avg'), inception_preprocess, (299, 299)
-        else:
-            raise ValueError(f"Unsupported model: {model_name}")
-
-    def extract_features(path, model, preprocess_func, target_size):
-        img = load_image_for_deep_learning(path, target_size)
-        img_array = np.expand_dims(img, axis=0)
-        img_array = preprocess_func(img_array)
-        features = model.predict(img_array)
-        return features.flatten()
-
-    def load_image_for_deep_learning(path, target_size):
-        if is_url(path):
-            temp_file, _ = urlretrieve(path)
-            img = Image.open(temp_file).convert('RGB')
-            os.unlink(temp_file)
-        else:
-            img = Image.open(path).convert('RGB')
-        img = img.resize(target_size)
-        return image.img_to_array(img)
-
-    model, preprocess_func, target_size = load_model(method)
-
-    def compute_similarity(path1, path2):
-        features1 = extract_features(path1, model, preprocess_func, target_size)
-        features2 = extract_features(path2, model, preprocess_func, target_size)
-        return cosine_similarity([features1], [features2])[0][0]
-
-    return compute_similarity
-
-# 主比较函数
-def compare_images(path1, path2, methods):
-    """
-    比较两张图片的相似度,使用多种方法
-    """
-    results = {}
-    
-    img1 = load_image(path1)
-    img2 = load_image(path2)
-    
+def calculate_template_matching(img1_path, img2_path):
+    """使用模板匹配计算相似度"""
+    img1 = cv2.imdecode(np.fromfile(img1_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+    img2 = cv2.imdecode(np.fromfile(img2_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
     if img1 is None or img2 is None:
-        return 0, results
+        return None
+    img2 = cv2.resize(img2, (img1.shape[1], img1.shape[0]))
+    res = cv2.matchTemplate(img1, img2, cv2.TM_CCOEFF_NORMED)
+    return np.max(res)
 
-    if 'ssim' in methods:
-        results['ssim'] = ssim(img1, img2)
+# 处理单个图片组，返回所有相似的图片对及其相似度
+def process_group(group_name, image_paths, threshold=0.8, model_name='resnet50', methods=None, logger=None):
+    feature_extractor = SiameseFeatureExtractor(model_name, logger)
+    features = []
+    valid_image_paths = []
+    for path in image_paths:
+        path = os.path.normpath(path)
+        feat = feature_extractor.extract_features(path)
+        if feat is not None:
+            features.append(feat)
+            valid_image_paths.append(path)
     
-    if 'phash' in methods:
-        img1_pil = Image.fromarray(img1)
-        img2_pil = Image.fromarray(img2)
-        hash1 = imagehash.phash(img1_pil)
-        hash2 = imagehash.phash(img2_pil)
-        results['phash'] = 1 - (hash1 - hash2) / 64  # 归一化到[0, 1]区间
+    similar_pairs = []
+    n = len(features)
     
-    # 显式删除大型对象
-    del img1, img2, img1_pil, img2_pil
-    
-    combined_sim = sum(results.values()) / len(results) if results else 0
-    return combined_sim, results
-
-def process_group(group_name, group_images, methods, threshold, logger):
-    logger.info(f"开始处理组 {group_name}")
-    results = []
-    n = len(group_images)
-    for i in tqdm(range(n), desc=f"处理组 {group_name}"):
-        for j in range(i+1, n):
-            try:
-                similarity, details = compare_images(group_images[i], group_images[j], methods)
-                if similarity > threshold:
-                    results.append((group_images[i], group_images[j], similarity, details))
-            except Exception as e:
-                logger.error(f"处理图片 {group_images[i]} 和 {group_images[j]} 时出错: {e}")
-    
-    if results:
-        logger.info(f"组 {group_name} 找到 {len(results)} 对相似图片")
-    else:
-        logger.info(f"组 {group_name} 没有找到相似图片")
-    
-    return group_name, results
-
-def process_groups_in_batches(groups, methods, threshold, num_processes, logger, batch_size=50):
-    all_results = {}
-    group_items = list(groups.items())
-    total_batches = (len(group_items) + batch_size - 1) // batch_size
-
-    for i in tqdm(range(0, len(group_items), batch_size), total=total_batches, desc="处理批次"):
-        batch = dict(group_items[i:i+batch_size])
-        logger.info(f"处理批次 {i//batch_size + 1}/{total_batches}, 包含 {len(batch)} 组")
-        
-        with ProcessPoolExecutor(max_workers=num_processes) as executor:
-            future_to_group = {executor.submit(process_group, name, images, methods, threshold, logger): name 
-                               for name, images in batch.items()}
+    for i in range(n):
+        for j in range(i + 1, n):
+            similarity = compute_cosine_similarity(features[i], features[j])
+            result = {
+                'Group Name': group_name,
+                'Image 1': valid_image_paths[i],
+                'Image 2': valid_image_paths[j],
+                'Model Similarity': similarity
+            }
             
-            for future in concurrent.futures.as_completed(future_to_group):
-                group_name, group_result = future.result()
-                all_results[group_name] = group_result
-
-    return all_results
-
-def save_results_to_excel(results: Dict[str, List[Tuple[str, str, float, Dict[str, float]]]], methods: List[str], filename: str = 'similar_images.xlsx', logger=None):
-    data = []
-    for group_name, similarities in results.items():
-        if not similarities:
-            row = [str(group_name), "无相似性图片", "", ""] + [""] * len(methods)
-        else:
-            similar_images = set()
-            for sim in similarities:
-                similar_images.add(sim[0])
-                similar_images.add(sim[1])
+            if methods:
+                if 'histogram' in methods:
+                    result['Histogram Similarity'] = calculate_histogram_similarity(valid_image_paths[i], valid_image_paths[j])
+                if 'ssim' in methods:
+                    result['SSIM Similarity'] = calculate_ssim(valid_image_paths[i], valid_image_paths[j])
+                if 'hash' in methods:
+                    result['Hash Similarity'] = calculate_hash_similarity(valid_image_paths[i], valid_image_paths[j])
+                if 'mse' in methods:
+                    result['MSE'] = calculate_mse(valid_image_paths[i], valid_image_paths[j])
+                if 'psnr' in methods:
+                    result['PSNR'] = calculate_psnr(valid_image_paths[i], valid_image_paths[j])
+                if 'template' in methods:
+                    result['Template Matching'] = calculate_template_matching(valid_image_paths[i], valid_image_paths[j])
             
-            avg_similarity = sum(sim[2] for sim in similarities) / len(similarities)
-            method_scores = {m: sum(sim[3].get(m, 0) for sim in similarities) / len(similarities) for m in methods}
-            
-            row = [
-                str(group_name),
-                "有相似性图片",
-                f"{len(similarities)}对",
-                f"{len(similar_images)}张"
-            ]
-            row.extend([f"{avg_similarity:.4f}"] + [f"{method_scores.get(m, 0):.4f}" for m in methods])
-            row.append(", ".join(similar_images))
-        
-        data.append(row)
-
-    columns = ['组名', '相似性', '相似对数', '相似图片数', '平均相似度'] + methods + ['相似图片']
-    df = pd.DataFrame(data, columns=columns)
+            # 检查是否有任何相似度超过阈值
+            if any(v >= threshold for k, v in result.items() if k != 'Group Name' and k != 'Image 1' and k != 'Image 2' and v is not None):
+                similar_pairs.append(result)
     
-    # 指定组名列为字符串类型
-    df['组名'] = df['组名'].astype(str)
-    
-    # 对结果进行排序
-    df = df.sort_values(by='平均相似度', ascending=False)
-    
-    # 使用 ExcelWriter 来设置列格式
-    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Sheet1')
-        workbook = writer.book
-        worksheet = writer.sheets['Sheet1']
-        
-        # 设置组名列为文本格式
-        for cell in worksheet['A']:
-            cell.number_format = '@'
-
     if logger:
-        logger.info(f"结果已保存到 {filename}")
-    else:
-        print(f"结果已保存到 {filename}")
-
-# 添加日志配置
-def setup_logger(log_file='image_similarity.log'):
-    logger = logging.getLogger('image_similarity')
-    logger.setLevel(logging.INFO)
-    file_handler = logging.FileHandler(log_file)
-    console_handler = logging.StreamHandler()
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-    file_handler.setFormatter(formatter)
-    console_handler.setFormatter(formatter)
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-    return logger
-
-# 主函数,适用于Jupyter Notebook
-def main(groups, methods, threshold, num_processes, log_file='image_similarity.log'):
-    """
-    主函数,执行图片相似度分析并输出结果
-    """
-    logger = setup_logger(log_file)
-    logger.info("开始执行图片相似度分析")
-    logger.info(f"图片组: 共{len(groups)}组")
-    logger.info(f"使用方法: {methods}")
-    logger.info(f"相似度阈值: {threshold}")
-    logger.info(f"并行进程数: {num_processes}")
-    
-    # 查找相似图片
-    similar_pairs = process_groups_in_batches(groups, methods, threshold, num_processes, logger)
-    
-    # 保存结果到Excel
-    save_results_to_excel(similar_pairs, methods, 'similar_images.xlsx', logger)
-    
-    logger.info("图片相似度分析完成")
+        logger.info(f"组 {group_name} 处理完成，找到 {len(similar_pairs)} 对相似图片")
     return similar_pairs
 
-# 示例用法
+# 修改 process_groups 函数
+def process_groups(groups: Dict[str, List[str]], threshold=0.8, num_workers=8, model_name='resnet50', methods=None, logger=None):
+    results = []
+    with torch.no_grad():
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            future_to_group = {executor.submit(process_group, group_name, image_paths, threshold, model_name, methods, logger): group_name 
+                               for group_name, image_paths in groups.items()}
+            
+            for future in tqdm(concurrent.futures.as_completed(future_to_group), total=len(groups), desc="处理图片组"):
+                group_name = future_to_group[future]
+                group_result = future.result()
+                results.extend(group_result)
+                
+                if logger:
+                    logger.info(f"组 {group_name} 处理完成")
+                    if group_result:
+                        logger.info(f"组 {group_name} 找到 {len(group_result)} 对相似图片")
+                    else:
+                        logger.info(f"组 {group_name} 没有找到相似的图片对")
+    
+    return results
+
+# 保存结果到Excel
+def save_results_to_excel(results: List[Dict[str, any]], filename, logger=None):
+    if not results:
+        if logger:
+            logger.info("没有找到任何相似的图片对。")
+        return
+    
+    df = pd.DataFrame(results)
+    # 字符串格式保存组名编码列
+    df.iloc[:, 0] = df.iloc[:, 0].astype(str)
+    df.to_excel(filename, index=False, engine='openpyxl')
+    if logger:
+        logger.info(f"结果已保存到 {filename}")
+
+# 添加这个函数来处理路径编码
+def encode_path(path):
+    if sys.platform.startswith('win'):
+        return path.encode('gbk').decode('gbk')
+    return path
+
+# 修改 main 函数中的路径处理
+def main(image_groups: Dict[str, List[str]], threshold=0.8, num_workers=8, model_name='resnet50', 
+         methods=None, output_dir='', log_file='similarity_log.txt'):
+    logger = setup_logger(os.path.join(output_dir, log_file))
+    
+    # 规范化所有图像路径并进行编码
+    normalized_groups = {
+        group_name: [encode_path(os.path.normpath(path)) for path in paths]
+        for group_name, paths in image_groups.items()
+    }
+    
+    logger.info(f"开始处理图片组，使用模型: {model_name}")
+    logger.info(f"使用的相似度方法: {', '.join(methods) if methods else '仅深度学习模型'}")
+    
+    results = process_groups(normalized_groups, threshold, num_workers, model_name, methods, logger)
+    
+    final_output_file = os.path.join(output_dir, 'image_similarity_results.xlsx')
+    save_results_to_excel(results, final_output_file, logger)
+    return results
+
 if __name__ == "__main__":
-    # 图片url表 
+     # 图片url表 
     img_df = pd.read_excel('../table/img_info_20241010_1427.xlsx')
     # 首先，过滤出 wjfl 为 1300 的图片
     filtered_df = img_df[img_df['wjfl'] == 1300]
     # 使用 groupby 和 agg 来创建字典
     img_url_dict = filtered_df.groupby('glbh')['wjlj'].agg(list).to_dict()
-    # 使用main函数进行图片相似度计算
-    # groups = dict(list(img_url_dict.items()))   # 图片组 这里只示例前5组
     groups = img_url_dict
-    # methods = ['ssim','phash','vgg16','resnet50','inceptionv3']  # 相似度计算方法  这里选择ssim,histogram,phash三种方法组合。 # resnet50 vgg16 inceptionv3
-    methods = ['phash','ssim','histogram']  # 相似度计算方法  这里选择ssim,histogram,phash三种方法组合。 # resnet50 vgg16 inceptionv3
-    threshold = 0.6  # 相似度阈值
+    output_directory = encode_path(r'C:\Users\Runker\Desktop\similarity_results')
+    os.makedirs(output_directory, exist_ok=True)
+    log_file = os.path.join(output_directory, 'similarity_log.txt')
+    # 指定要使用的传统方法
+    methods = ['histogram', 'ssim', 'hash', 'mse', 'psnr', 'template']
+    # 指定要使用的深度学习模型
+    model_name='resnet50'
+    threshold = 0.8  # 相似度阈值
     num_processes = min(os.cpu_count(), 48)  # 减少进程数以降低磁盘压力
-    main(groups,methods,threshold,num_processes)
+    # 深度学习选用resnet50
+    results = main(image_groups, threshold=threshold, num_workers=num_processes, model_name=model_name, methods=methods, output_dir=output_directory, log_file=log_file)
+
