@@ -12,7 +12,7 @@
 2. 直方图比较（Histogram）
 3. 感知哈希（pHash）
 4. 均方误差（MSE）
-5. 深度学习特征提取（ResNet50、VGG16、InceptionV3）
+5. 深度学习特征提取（ResNet50、VGG16、InceptionV3、DenseNet121）
 
 通过为这些不同的方法提供一个统一的平台，我们使研究人员能够进行比较分析，并为他们的特定用例选择最合适的技术。
 
@@ -32,7 +32,7 @@
 - **ResNet50**：具有50层的深度残差网络。
 - **VGG16**：以其简单性和有效性而著称的16层网络。
 - **InceptionV3**：专注于高效计算和网络扩展的Inception架构。
-
+- **DenseNet121**：具有121层的密集连接卷积网络。
 从每个网络的倒数第二层提取特征，并使用余弦相似度计算相似性。
 
 ## 实现
@@ -41,9 +41,18 @@
 
 - OpenCV,PIL用于图像处理
 - scikit-image用于SSIM计算
-- TensorFlow,Pytorch和Keras用于深度学习模型
+- Pytorch用于深度学习模型
 - Pandas用于数据管理和导出
 - imagehash用于pHash
+
+## 主要特性
+
+- 多线程处理，高效处理大型图像数据集
+- 支持本地文件和基于URL的图像源
+- 全面的日志系统，用于跟踪分析进度和结果
+- 灵活的配置选项，可设置相似度阈值和方法选择
+- 以Excel格式输出结果，便于分析和可视化
+
 
 ## 使用方法
 
@@ -179,3 +188,4 @@ InceptionV3是Google提出的一种高效的卷积神经网络结构。
 2. He, K., et al. (2016). "Deep residual learning for image recognition." CVPR.
 3. Simonyan, K., & Zisserman, A. (2014). "Very deep convolutional networks for large-scale image recognition." arXiv preprint arXiv:1409.1556.
 4. Szegedy, C., et al. (2016). "Rethinking the inception architecture for computer vision." CVPR.
+5. Bradski, G. (2000). "The OpenCV Library." Dr. Dobb's Journal of Software Tools.
