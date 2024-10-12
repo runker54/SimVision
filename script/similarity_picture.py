@@ -548,5 +548,7 @@ if __name__ == "__main__":
     num_workers = 48
     # 批次大小
     batch_size = 50
+    # 设置多进程启动方法
+    set_start_method()
     main(groups, threshold=threshold, num_workers=num_workers, model_names=model_names, 
          methods=methods, output_dir=output_directory, log_file=log_file, batch_size=batch_size)
