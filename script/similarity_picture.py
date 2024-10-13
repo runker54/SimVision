@@ -704,7 +704,7 @@ if __name__ == "__main__":
     groups = dict(list(img_url_dict.items())[:5])
     output_directory = '../result'
     os.makedirs(output_directory, exist_ok=True)
-    log_file = os.path.join(output_directory, 'similarity_log.txt')
+    log_file = 'similarity_log.txt'
     # 指定要使用的传统方法 可选：histogram, hash, mse, template, phash，ssim，glcm
     methods = ['histogram', 'hash', 'mse', 'template', 'phash']
     # 深度学习预训练模型 可选：resnet50, vgg16, densenet121，inception_v3, mobilenet_v2, efficientnet_b0, resnext50_32x4d, resnext101_32x8d, wide_resnet50_2, wide_resnet101_2
